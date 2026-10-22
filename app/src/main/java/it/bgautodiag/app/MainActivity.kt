@@ -1,10 +1,13 @@
-
 package it.bgautodiag.app
 
 import android.Manifest
 import android.app.Activity
+import android.bluetooth.BluetoothDevice
+import android.bluetooth.BluetoothGatt
+import android.bluetooth.BluetoothGattCallback
 import android.bluetooth.BluetoothManager
-import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothProfile
+import android.bluetooth.BluetoothGattCharacteristic
 import android.bluetooth.le.BluetoothLeScanner
 import android.bluetooth.le.ScanCallback
 import android.bluetooth.le.ScanResult
@@ -15,6 +18,7 @@ import android.os.Handler
 import android.os.Looper
 import android.graphics.Color
 import android.view.Gravity
+import android.view.View
 import android.widget.Button
 import android.widget.LinearLayout
 import android.widget.ScrollView
@@ -23,23 +27,24 @@ import android.widget.TextView
 class MainActivity : Activity() {
 
     private lateinit var status: TextView
-    private lateinit var devices: TextView
+    private lateinit var deviceList: LinearLayout
     private lateinit var scanButton: Button
+    private lateinit var disconnectButton: Button
 
     private var scanner: BluetoothLeScanner? = null
     private var scanning = false
+    private var gatt: BluetoothGatt? = null
 
     private val handler = Handler(Looper.getMainLooper())
-    private val foundDevices = linkedMapOf<String, String>()
+    private val foundDevices = linkedMapOf<String, BluetoothDevice>()
 
     private val stopScanTask = Runnable {
         stopScan()
         status.text = if (foundDevices.isEmpty()) {
             "Ricerca terminata. Nessun dispositivo BLE trovato."
         } else {
-            "Ricerca terminata. Dispositivi trovati: ${foundDevices.size}"
+            "Ricerca terminata. Dispositivi trovati: ${foundDevices.size}. Tocca un dispositivo per collegarti."
         }
-        updateDeviceList()
         scanButton.isEnabled = true
     }
 
@@ -48,18 +53,19 @@ class MainActivity : Activity() {
             callbackType: Int,
             result: ScanResult
         ) {
-            runOnUiThread {
-                val address = result.device.address
-                val name = try {
-                    result.scanRecord?.deviceName
-                        ?: result.device.name
-                        ?: "Dispositivo BLE senza nome"
-                } catch (_: SecurityException) {
-                    "Dispositivo BLE"
-                }
+            try {
+                val device = result.device
+                val address = device.address
+                foundDevices[address] = device
 
-                foundDevices[address] = "$name\n$address"
-                updateDeviceList()
+                runOnUiThread {
+                    renderDevices()
+                    status.text = "Dispositivo trovato: ${foundDevices.size}"
+                }
+            } catch (_: SecurityException) {
+                runOnUiThread {
+                    status.text = "Permesso Bluetooth mancante."
+                }
             }
         }
 
@@ -67,8 +73,92 @@ class MainActivity : Activity() {
             runOnUiThread {
                 scanning = false
                 handler.removeCallbacks(stopScanTask)
-                status.text = "Scansione fallita. Codice errore: $errorCode"
+                status.text = "Scansione fallita. Codice: $errorCode"
                 scanButton.isEnabled = true
+            }
+        }
+    }
+
+    private val gattCallback = object : BluetoothGattCallback() {
+
+        override fun onConnectionStateChange(
+            bluetoothGatt: BluetoothGatt,
+            statusCode: Int,
+            newState: Int
+        ) {
+            runOnUiThread {
+                if (statusCode != BluetoothGatt.GATT_SUCCESS) {
+                    status.text = "Errore connessione BLE: $statusCode"
+                    disconnectButton.isEnabled = false
+                    return@runOnUiThread
+                }
+
+                when (newState) {
+                    BluetoothProfile.STATE_CONNECTED -> {
+                        status.text = "Bluetooth connesso. Ricerca servizi..."
+                        try {
+                            bluetoothGatt.discoverServices()
+                        } catch (_: SecurityException) {
+                            status.text = "Permesso Bluetooth mancante."
+                        }
+                    }
+
+                    BluetoothProfile.STATE_DISCONNECTED -> {
+                        status.text = "Dispositivo disconnesso."
+                        disconnectButton.isEnabled = false
+                    }
+                }
+            }
+        }
+
+        override fun onServicesDiscovered(
+            bluetoothGatt: BluetoothGatt,
+            statusCode: Int
+        ) {
+            runOnUiThread {
+                if (statusCode != BluetoothGatt.GATT_SUCCESS) {
+                    status.text = "Connesso, ma lettura servizi fallita: $statusCode"
+                    return@runOnUiThread
+                }
+
+                val report = StringBuilder()
+                report.append("Connessione BLE riuscita.\n\n")
+                report.append("Servizi e caratteristiche:\n")
+
+                for (service in bluetoothGatt.services) {
+                    report.append("\nServizio:\n${service.uuid}\n")
+
+                    for (characteristic in service.characteristics) {
+                        val properties = characteristic.properties
+                        val labels = mutableListOf<String>()
+
+                        if (properties and BluetoothGattCharacteristic.PROPERTY_READ != 0) {
+                            labels.add("READ")
+                        }
+                        if (properties and BluetoothGattCharacteristic.PROPERTY_WRITE != 0) {
+                            labels.add("WRITE")
+                        }
+                        if (properties and BluetoothGattCharacteristic.PROPERTY_WRITE_NO_RESPONSE != 0) {
+                            labels.add("WRITE_NO_RESPONSE")
+                        }
+                        if (properties and BluetoothGattCharacteristic.PROPERTY_NOTIFY != 0) {
+                            labels.add("NOTIFY")
+                        }
+                        if (properties and BluetoothGattCharacteristic.PROPERTY_INDICATE != 0) {
+                            labels.add("INDICATE")
+                        }
+
+                        report.append("  ${characteristic.uuid}\n")
+                        report.append("  ${labels.joinToString(", ")}\n")
+                    }
+                }
+
+                if (bluetoothGatt.services.isEmpty()) {
+                    report.append("\nNessun servizio trovato.")
+                }
+
+                status.text = report.toString()
+                disconnectButton.isEnabled = true
             }
         }
     }
@@ -79,7 +169,7 @@ class MainActivity : Activity() {
         val layout = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             gravity = Gravity.CENTER_HORIZONTAL
-            setPadding(32, 32, 32, 32)
+            setPadding(24, 24, 24, 24)
             setBackgroundColor(Color.WHITE)
         }
 
@@ -91,42 +181,48 @@ class MainActivity : Activity() {
         }
 
         val description = TextView(this).apply {
-            text = "Ricerca adattatori diagnostici Bluetooth LE"
+            text = "Connessione adattatori diagnostici BLE"
             textSize = 16f
             setTextColor(Color.DKGRAY)
             gravity = Gravity.CENTER
+            setPadding(0, 8, 0, 16)
         }
 
         status = TextView(this).apply {
             text = "Premi il pulsante per cercare gli adattatori."
-            textSize = 16f
+            textSize = 14f
             setTextColor(Color.BLACK)
-            setPadding(0, 24, 0, 16)
+            setPadding(0, 12, 0, 12)
         }
 
         scanButton = Button(this).apply {
             text = "Cerca adattatori BLE"
-            isEnabled = true
             setOnClickListener {
                 checkPermissionsAndScan()
             }
         }
 
-        devices = TextView(this).apply {
-            text = "Nessun dispositivo trovato."
-            textSize = 15f
-            setTextColor(Color.BLACK)
-            setPadding(0, 20, 0, 0)
+        disconnectButton = Button(this).apply {
+            text = "Disconnetti"
+            isEnabled = false
+            setOnClickListener {
+                closeConnection()
+                status.text = "Disconnesso."
+            }
+        }
+
+        deviceList = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
         }
 
         val scroll = ScrollView(this).apply {
-            addView(devices)
+            addView(deviceList)
         }
 
         layout.addView(title)
         layout.addView(description)
-        layout.addView(status)
         layout.addView(scanButton)
+        layout.addView(disconnectButton)
         layout.addView(
             scroll,
             LinearLayout.LayoutParams(
@@ -164,11 +260,7 @@ class MainActivity : Activity() {
         permissions: Array<out String>,
         grantResults: IntArray
     ) {
-        super.onRequestPermissionsResult(
-            requestCode,
-            permissions,
-            grantResults
-        )
+        super.onRequestPermissionsResult(requestCode, permissions, grantResults)
 
         if (requestCode == REQUEST_BLUETOOTH) {
             if (grantResults.isNotEmpty() &&
@@ -176,8 +268,7 @@ class MainActivity : Activity() {
             ) {
                 startScan()
             } else {
-                status.text =
-                    "Permessi Bluetooth necessari per cercare gli adattatori."
+                status.text = "Permessi Bluetooth necessari."
             }
         }
     }
@@ -185,28 +276,23 @@ class MainActivity : Activity() {
     private fun startScan() {
         try {
             val manager = getSystemService(BluetoothManager::class.java)
-            val adapter: BluetoothAdapter? = manager?.adapter
+            val adapter = manager?.adapter
 
-            if (adapter == null) {
-                status.text = "Questo telefono non supporta Bluetooth."
+            if (adapter == null || !adapter.isEnabled) {
+                status.text = "Attiva il Bluetooth e riprova."
                 return
             }
 
-            if (!adapter.isEnabled) {
-                status.text =
-                    "Attiva il Bluetooth nelle impostazioni del telefono e riprova."
-                return
-            }
+            closeConnection()
+            foundDevices.clear()
+            renderDevices()
 
             scanner = adapter.bluetoothLeScanner
-
             if (scanner == null) {
                 status.text = "Scansione BLE non disponibile."
                 return
             }
 
-            foundDevices.clear()
-            updateDeviceList()
             scanning = true
             scanButton.isEnabled = false
             status.text = "Ricerca BLE in corso per 10 secondi..."
@@ -218,11 +304,76 @@ class MainActivity : Activity() {
         } catch (_: SecurityException) {
             scanning = false
             scanButton.isEnabled = true
-            status.text = "Permesso Bluetooth mancante. Controlla le autorizzazioni."
+            status.text = "Permesso Bluetooth mancante."
         } catch (_: Exception) {
             scanning = false
             scanButton.isEnabled = true
-            status.text = "Impossibile avviare la scansione Bluetooth."
+            status.text = "Impossibile avviare la scansione."
+        }
+    }
+
+    private fun renderDevices() {
+        deviceList.removeAllViews()
+
+        for ((address, device) in foundDevices) {
+            val row = TextView(this).apply {
+                text = try {
+                    val name = device.name ?: "Dispositivo BLE"
+                    "$name\n$address\nTocca per connetterti"
+                } catch (_: SecurityException) {
+                    "Dispositivo BLE\n$address"
+                }
+
+                textSize = 16f
+                setTextColor(Color.BLACK)
+                setPadding(12, 18, 12, 18)
+                setBackgroundColor(0xFFEFEFEF.toInt())
+                isClickable = true
+                isFocusable = true
+
+                setOnClickListener {
+                    connectToDevice(device)
+                }
+            }
+
+            deviceList.addView(
+                row,
+                LinearLayout.LayoutParams(
+                    LinearLayout.LayoutParams.MATCH_PARENT,
+                    LinearLayout.LayoutParams.WRAP_CONTENT
+                ).apply {
+                    bottomMargin = 8
+                }
+            )
+        }
+    }
+
+    private fun connectToDevice(device: BluetoothDevice) {
+        stopScan()
+        scanButton.isEnabled = true
+        closeConnection()
+        status.text = "Connessione al dispositivo in corso..."
+        disconnectButton.isEnabled = false
+
+        try {
+            gatt = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                device.connectGatt(
+                    this,
+                    false,
+                    gattCallback,
+                    BluetoothDevice.TRANSPORT_LE
+                )
+            } else {
+                device.connectGatt(this, false, gattCallback)
+            }
+
+            if (gatt == null) {
+                status.text = "Impossibile avviare la connessione BLE."
+            }
+        } catch (_: SecurityException) {
+            status.text = "Permesso Bluetooth mancante."
+        } catch (_: Exception) {
+            status.text = "Errore durante la connessione BLE."
         }
     }
 
@@ -232,25 +383,33 @@ class MainActivity : Activity() {
         try {
             scanner?.stopScan(scanCallback)
         } catch (_: SecurityException) {
-            // Il permesso potrebbe essere stato revocato.
+            // Permesso non disponibile.
         } catch (_: Exception) {
-            // La scansione potrebbe essere già terminata.
+            // Scansione già terminata.
         }
 
         scanning = false
+        handler.removeCallbacks(stopScanTask)
     }
 
-    private fun updateDeviceList() {
-        devices.text = if (foundDevices.isEmpty()) {
-            "Nessun dispositivo trovato."
-        } else {
-            foundDevices.values.joinToString("\n\n")
+    private fun closeConnection() {
+        try {
+            gatt?.disconnect()
+            gatt?.close()
+        } catch (_: SecurityException) {
+            // Permesso non disponibile.
+        } catch (_: Exception) {
+            // Connessione già chiusa.
         }
+
+        gatt = null
+        disconnectButton.isEnabled = false
     }
 
     override fun onDestroy() {
         handler.removeCallbacks(stopScanTask)
         stopScan()
+        closeConnection()
         super.onDestroy()
     }
 
